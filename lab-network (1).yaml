@@ -1,0 +1,356 @@
+AWSTemplateFormatVersion: 2010-09-09
+# CHANGED: description updated from the single-subnet sample to the cafe-app network.
+Description: >-
+  Network Template for the cafe app: a VPC across two Availability Zones with
+  public subnets, NAT gateways, private subnets, and a bastion host that only
+  accepts SSH from the workstation IP. Based on the class lab-network.yaml.
+
+# This template creates:
+#   VPC
+#   Internet Gateway
+#   Public Route Table
+#   Public Subnets (2, one per AZ)
+#   Elastic IPs and NAT Gateways (2, one per AZ)
+#   Private Route Tables (2, one per AZ)
+#   Private Subnets (2, one per AZ)
+#   Bastion Security Group and Bastion Host
+
+######################
+# Parameters section
+######################
+
+Parameters:
+
+  # NEW: CIDR for the VPC. Default is 10.1.0.0/16 because 10.0.0.0/16 is used
+  # by older networks in the same account.
+  VpcCidr:
+    Type: String
+    Default: 10.1.0.0/16
+    AllowedPattern: '^(\d{1,3}\.){3}\d{1,3}/\d{1,2}$'
+    Description: CIDR block for the VPC
+
+  # NEW: CIDR for the public subnet in AZ 1.
+  PublicSubnetACidr:
+    Type: String
+    Default: 10.1.0.0/24
+    AllowedPattern: '^(\d{1,3}\.){3}\d{1,3}/\d{1,2}$'
+    Description: CIDR block for the public subnet in the first AZ
+
+  # NEW: CIDR for the public subnet in AZ 2.
+  PublicSubnetBCidr:
+    Type: String
+    Default: 10.1.1.0/24
+    AllowedPattern: '^(\d{1,3}\.){3}\d{1,3}/\d{1,2}$'
+    Description: CIDR block for the public subnet in the second AZ
+
+  # NEW: CIDR for the private subnet in AZ 1 (holds app servers).
+  PrivateSubnetACidr:
+    Type: String
+    Default: 10.1.2.0/23
+    AllowedPattern: '^(\d{1,3}\.){3}\d{1,3}/\d{1,2}$'
+    Description: CIDR block for the private subnet in the first AZ
+
+  # NEW: CIDR for the private subnet in AZ 2 (holds app servers and the database standby).
+  PrivateSubnetBCidr:
+    Type: String
+    Default: 10.1.4.0/23
+    AllowedPattern: '^(\d{1,3}\.){3}\d{1,3}/\d{1,2}$'
+    Description: CIDR block for the private subnet in the second AZ
+
+  # NEW: required. Only this address can reach the bastion over SSH.
+  WorkstationCidr:
+    Type: String
+    AllowedPattern: '^(\d{1,3}\.){3}\d{1,3}/(3[0-2]|[12]?\d)$'
+    Description: >-
+      Your workstation public IP in CIDR form, for example 203.0.113.10/32.
+      The bastion accepts SSH only from this address.
+
+  # NEW: key pair used to SSH into the bastion.
+  BastionKeyPairName:
+    Type: AWS::EC2::KeyPair::KeyName
+    Description: Existing EC2 key pair name for the bastion host
+
+  # NEW: latest Amazon Linux 2023 AMI, resolved from SSM at deploy time.
+  BastionImageId:
+    Type: AWS::SSM::Parameter::Value<AWS::EC2::Image::Id>
+    Default: /aws/service/ami-amazon-linux-latest/al2023-ami-kernel-default-x86_64
+    Description: AMI for the bastion host (Amazon Linux 2023 by default)
+
+######################
+# Resources section
+######################
+
+Resources:
+
+  ## VPC
+
+  VPC:
+    Type: AWS::EC2::VPC
+    Properties:
+      EnableDnsSupport: true
+      EnableDnsHostnames: true
+      # CHANGED: was hardcoded 10.0.0.0/16. Now comes from the VpcCidr parameter.
+      CidrBlock: !Ref VpcCidr
+      Tags:
+        - Key: Name
+          Value: !Sub '${AWS::StackName}-vpc'
+
+  ## Internet Gateway
+
+  InternetGateway:
+    Type: AWS::EC2::InternetGateway
+    Properties:
+      Tags:
+        - Key: Name
+          Value: !Sub '${AWS::StackName}-igw'
+
+  VPCGatewayAttachment:
+    Type: AWS::EC2::VPCGatewayAttachment
+    Properties:
+      VpcId: !Ref VPC
+      InternetGatewayId: !Ref InternetGateway
+
+  ## Public Route Table (shared by both public subnets)
+
+  PublicRouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref VPC
+      Tags:
+        - Key: Name
+          Value: !Sub '${AWS::StackName}-public-rt'
+
+  PublicRoute:
+    Type: AWS::EC2::Route
+    DependsOn: VPCGatewayAttachment
+    Properties:
+      RouteTableId: !Ref PublicRouteTable
+      DestinationCidrBlock: 0.0.0.0/0
+      GatewayId: !Ref InternetGateway
+
+  ## Public Subnets
+
+  # CHANGED: the class template had one PublicSubnet. It is now two subnets,
+  # PublicSubnetA and PublicSubnetB, one per Availability Zone.
+  PublicSubnetA:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VPC
+      CidrBlock: !Ref PublicSubnetACidr
+      MapPublicIpOnLaunch: true
+      AvailabilityZone: !Select [0, !GetAZs '']
+      Tags:
+        - Key: Name
+          Value: !Sub '${AWS::StackName}-public-a'
+
+  PublicSubnetB:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VPC
+      CidrBlock: !Ref PublicSubnetBCidr
+      MapPublicIpOnLaunch: true
+      AvailabilityZone: !Select [1, !GetAZs '']
+      Tags:
+        - Key: Name
+          Value: !Sub '${AWS::StackName}-public-b'
+
+  PublicSubnetARouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PublicSubnetA
+      RouteTableId: !Ref PublicRouteTable
+
+  PublicSubnetBRouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PublicSubnetB
+      RouteTableId: !Ref PublicRouteTable
+
+  # CHANGED: removed PublicSubnetNetworkAclAssociation from the class template.
+  # The default network ACL already allows traffic, and the association was
+  # not needed for this design.
+
+  ## NAT Gateways (one per AZ so each private subnet keeps outbound access
+  ## even if the other AZ fails)
+
+  # NEW: Elastic IP for NAT gateway in AZ 1.
+  EipNatA:
+    Type: AWS::EC2::EIP
+    DependsOn: VPCGatewayAttachment
+    Properties:
+      Domain: vpc
+
+  # NEW: Elastic IP for NAT gateway in AZ 2.
+  EipNatB:
+    Type: AWS::EC2::EIP
+    DependsOn: VPCGatewayAttachment
+    Properties:
+      Domain: vpc
+
+  # NEW: NAT gateway in the public subnet of AZ 1.
+  NatGatewayA:
+    Type: AWS::EC2::NatGateway
+    Properties:
+      AllocationId: !GetAtt EipNatA.AllocationId
+      SubnetId: !Ref PublicSubnetA
+      Tags:
+        - Key: Name
+          Value: !Sub '${AWS::StackName}-nat-a'
+
+  # NEW: NAT gateway in the public subnet of AZ 2.
+  NatGatewayB:
+    Type: AWS::EC2::NatGateway
+    Properties:
+      AllocationId: !GetAtt EipNatB.AllocationId
+      SubnetId: !Ref PublicSubnetB
+      Tags:
+        - Key: Name
+          Value: !Sub '${AWS::StackName}-nat-b'
+
+  ## Private Subnets
+
+  # NEW: private subnet in AZ 1. No public IP on launch.
+  PrivateSubnetA:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VPC
+      CidrBlock: !Ref PrivateSubnetACidr
+      MapPublicIpOnLaunch: false
+      AvailabilityZone: !Select [0, !GetAZs '']
+      Tags:
+        - Key: Name
+          Value: !Sub '${AWS::StackName}-private-a'
+
+  # NEW: private subnet in AZ 2. No public IP on launch.
+  PrivateSubnetB:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VPC
+      CidrBlock: !Ref PrivateSubnetBCidr
+      MapPublicIpOnLaunch: false
+      AvailabilityZone: !Select [1, !GetAZs '']
+      Tags:
+        - Key: Name
+          Value: !Sub '${AWS::StackName}-private-b'
+
+  ## Private Route Tables (one per AZ, each pointing at its local NAT)
+
+  # NEW: private route table for AZ 1.
+  PrivateRouteTableA:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref VPC
+      Tags:
+        - Key: Name
+          Value: !Sub '${AWS::StackName}-private-rt-a'
+
+  # NEW: default route for AZ 1 goes to NAT gateway A.
+  PrivateRouteA:
+    Type: AWS::EC2::Route
+    Properties:
+      RouteTableId: !Ref PrivateRouteTableA
+      DestinationCidrBlock: 0.0.0.0/0
+      NatGatewayId: !Ref NatGatewayA
+
+  # NEW: private route table for AZ 2.
+  PrivateRouteTableB:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref VPC
+      Tags:
+        - Key: Name
+          Value: !Sub '${AWS::StackName}-private-rt-b'
+
+  # NEW: default route for AZ 2 goes to NAT gateway B.
+  PrivateRouteB:
+    Type: AWS::EC2::Route
+    Properties:
+      RouteTableId: !Ref PrivateRouteTableB
+      DestinationCidrBlock: 0.0.0.0/0
+      NatGatewayId: !Ref NatGatewayB
+
+  PrivateSubnetARouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PrivateSubnetA
+      RouteTableId: !Ref PrivateRouteTableA
+
+  PrivateSubnetBRouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PrivateSubnetB
+      RouteTableId: !Ref PrivateRouteTableB
+
+  ## Bastion
+
+  # NEW: only SSH from the workstation IP. Nothing else can reach the bastion.
+  BastionSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: SSH from the workstation IP only
+      VpcId: !Ref VPC
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 22
+          ToPort: 22
+          CidrIp: !Ref WorkstationCidr
+      Tags:
+        - Key: Name
+          Value: !Sub '${AWS::StackName}-bastion-sg'
+
+  # NEW: bastion host in public subnet A, used to reach private instances if needed.
+  BastionHost:
+    Type: AWS::EC2::Instance
+    Properties:
+      ImageId: !Ref BastionImageId
+      InstanceType: t3.micro
+      KeyName: !Ref BastionKeyPairName
+      SubnetId: !Ref PublicSubnetA
+      SecurityGroupIds:
+        - !Ref BastionSecurityGroup
+      Tags:
+        - Key: Name
+          Value: !Sub '${AWS::StackName}-bastion'
+
+######################
+# Outputs section
+######################
+
+Outputs:
+
+  # CHANGED: exports now cover both AZs. The class template exported only
+  # PublicSubnet as "-SubnetID". Application stacks should import the
+  # names below.
+  VPC:
+    Description: VPC ID
+    Value: !Ref VPC
+    Export:
+      Name: !Sub '${AWS::StackName}-VPCID'
+
+  PublicSubnetA:
+    Description: Public subnet in AZ 1 (load balancer)
+    Value: !Ref PublicSubnetA
+    Export:
+      Name: !Sub '${AWS::StackName}-PublicSubnetAID'
+
+  PublicSubnetB:
+    Description: Public subnet in AZ 2 (load balancer)
+    Value: !Ref PublicSubnetB
+    Export:
+      Name: !Sub '${AWS::StackName}-PublicSubnetBID'
+
+  PrivateSubnetA:
+    Description: Private subnet in AZ 1 (app servers and database)
+    Value: !Ref PrivateSubnetA
+    Export:
+      Name: !Sub '${AWS::StackName}-PrivateSubnetAID'
+
+  PrivateSubnetB:
+    Description: Private subnet in AZ 2 (app servers and database)
+    Value: !Ref PrivateSubnetB
+    Export:
+      Name: !Sub '${AWS::StackName}-PrivateSubnetBID'
+
+  BastionPublicIp:
+    Description: Public IP of the bastion (SSH only from WorkstationCidr)
+    Value: !GetAtt BastionHost.PublicIp

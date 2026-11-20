@@ -1,0 +1,346 @@
+AWSTemplateFormatVersion: 2010-09-09
+# CHANGED: description updated from the single-instance sample to the cafe app.
+Description: >-
+  Application Template for the cafe app: an Application Load Balancer in front
+  of an Auto Scaling group of app servers in private subnets, and a Multi-AZ RDS
+  MariaDB database. Imports the VPC and subnets from the lab-network stack.
+
+# This template creates:
+#   Security Groups (ALB, app servers, database)
+#   DB Subnet Group
+#   RDS MariaDB DB Instance (Multi-AZ)
+#   Launch Template
+#   Target Group
+#   Application Load Balancer and Listener
+#   Auto Scaling Group
+#   Target Tracking Scaling Policy (average CPU)
+
+######################
+# Parameters section
+######################
+
+Parameters:
+
+  NetworkStackName:
+    Description: >-
+      Name of an active CloudFormation stack that contains the networking
+      resources (the lab-network stack).
+    Type: String
+    MinLength: 1
+    MaxLength: 255
+    AllowedPattern: '^[a-zA-Z][-a-zA-Z0-9]*$'
+    Default: lab-network
+
+  # CHANGED: was an SSM lookup for the Amazon Linux 2 AMI from the class lab.
+  # The app needs the cafe AMI you built, so the AMI ID is now a required input.
+  CafeAmiId:
+    Type: AWS::EC2::Image::Id
+    Description: AMI ID of the cafe app image (cafe-app-elastic)
+
+  # NEW: instance type for app servers. t3.medium stalls below the scaling
+  # target under sustained load; m5.large is the non-burstable option.
+  InstanceType:
+    Type: String
+    Default: t3.medium
+    AllowedValues:
+      - t3.medium
+      - m5.large
+    Description: Instance type for the app servers
+
+  # NEW: name of the instance profile that gives app servers their IAM role.
+  CafeInstanceProfileName:
+    Type: String
+    Default: cafe-app-role
+    Description: IAM instance profile for the app servers (reads Secrets Manager)
+
+  # NEW: Auto Scaling group size, parameterized as the assignment requires.
+  AsgMinSize:
+    Type: Number
+    Default: 2
+    MinValue: 1
+    Description: Minimum number of app servers
+
+  AsgDesiredCapacity:
+    Type: Number
+    Default: 2
+    MinValue: 1
+    Description: Desired number of app servers at deploy time
+
+  AsgMaxSize:
+    Type: Number
+    Default: 4
+    MinValue: 1
+    Description: Maximum number of app servers
+
+  # NEW: health check path. A static file, so a slow database query does
+  # not get healthy servers replaced.
+  HealthCheckPath:
+    Type: String
+    Default: /cafe/css/styles.css
+    Description: Path the load balancer checks for app server health
+
+  # NEW: database settings.
+  DbInstanceClass:
+    Type: String
+    Default: db.t3.micro
+    Description: Instance class for the database
+
+  DbMultiAZ:
+    Type: String
+    Default: 'true'
+    AllowedValues:
+      - 'true'
+      - 'false'
+    Description: Create a standby in a second AZ
+
+  # NEW: leave empty to create a fresh database. Set to cafe-db-snap to restore
+  # the café data from the earlier migration.
+  DbSnapshotIdentifier:
+    Type: String
+    Default: ''
+    Description: >-
+      Optional DB snapshot to restore from. Leave blank for an empty database.
+
+  DbMasterUsername:
+    Type: String
+    Default: admin
+    Description: Master username (used only when not restoring from a snapshot)
+
+  DbMasterPassword:
+    Type: String
+    NoEcho: true
+    MinLength: 8
+    Description: >-
+      Master password (used only when not restoring from a snapshot). Must
+      contain letters and numbers only.
+
+######################
+# Conditions section
+######################
+
+Conditions:
+
+  # NEW: true when a snapshot name was provided.
+  HasDbSnapshot: !Not [!Equals [!Ref DbSnapshotIdentifier, '']]
+
+######################
+# Resources section
+######################
+
+Resources:
+
+  ## Security Groups
+
+  # NEW: load balancer accepts HTTP from anywhere.
+  AlbSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: HTTP from anywhere to the load balancer
+      VpcId:
+        Fn::ImportValue: !Sub '${NetworkStackName}-VPCID'
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 80
+          ToPort: 80
+          CidrIp: 0.0.0.0/0
+      Tags:
+        - Key: Name
+          Value: !Sub '${AWS::StackName}-alb-sg'
+
+  # CHANGED: the class template opened the web server to 0.0.0.0/0 and SSH to
+  # 0.0.0.0/0. Now HTTP comes only from the load balancer, and SSH is removed
+  # because instances are managed through Session Manager.
+  AppSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: HTTP from the load balancer only
+      VpcId:
+        Fn::ImportValue: !Sub '${NetworkStackName}-VPCID'
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 80
+          ToPort: 80
+          SourceSecurityGroupId: !Ref AlbSecurityGroup
+      Tags:
+        - Key: Name
+          Value: !Sub '${AWS::StackName}-app-sg'
+
+  # NEW: database accepts MySQL only from the app servers.
+  RdsSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: MySQL from the app servers only
+      VpcId:
+        Fn::ImportValue: !Sub '${NetworkStackName}-VPCID'
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 3306
+          ToPort: 3306
+          SourceSecurityGroupId: !Ref AppSecurityGroup
+      Tags:
+        - Key: Name
+          Value: !Sub '${AWS::StackName}-rds-sg'
+
+  ## Database
+
+  # NEW: subnet group across both private subnets, so Multi-AZ can place a standby.
+  DbSubnetGroup:
+    Type: AWS::RDS::DBSubnetGroup
+    Properties:
+      DBSubnetGroupDescription: Private subnets in both AZs
+      SubnetIds:
+        - Fn::ImportValue: !Sub '${NetworkStackName}-PrivateSubnetAID'
+        - Fn::ImportValue: !Sub '${NetworkStackName}-PrivateSubnetBID'
+
+  # NEW: MariaDB database. Restores from a snapshot when DbSnapshotIdentifier is set.
+  # DeletionPolicy Snapshot keeps a final backup if the stack is deleted.
+  DbInstance:
+    Type: AWS::RDS::DBInstance
+    DeletionPolicy: Snapshot
+    UpdateReplacePolicy: Snapshot
+    Properties:
+      Engine: mariadb
+      DBInstanceClass: !Ref DbInstanceClass
+      AllocatedStorage: 200  # CHANGED: must match the snapshot size (200 GiB) when restoring; 20 failed
+      StorageType: gp2
+      MultiAZ: !Ref DbMultiAZ
+      PubliclyAccessible: false
+      DBSubnetGroupName: !Ref DbSubnetGroup
+      VPCSecurityGroups:
+        - !Ref RdsSecurityGroup
+      # When restoring, RDS uses the snapshot's username and password, so
+      # these two properties are left out.
+      DBSnapshotIdentifier: !If [HasDbSnapshot, !Ref DbSnapshotIdentifier, !Ref AWS::NoValue]
+      MasterUsername: !If [HasDbSnapshot, !Ref AWS::NoValue, !Ref DbMasterUsername]
+      MasterUserPassword: !If [HasDbSnapshot, !Ref AWS::NoValue, !Ref DbMasterPassword]
+      Tags:
+        - Key: Name
+          Value: !Sub '${AWS::StackName}-db'
+
+  ## Compute
+
+  # CHANGED: replaces the single WebServerInstance from the class template.
+  # Launch template plus Auto Scaling group lets the group replace and scale servers.
+  AppLaunchTemplate:
+    Type: AWS::EC2::LaunchTemplate
+    Properties:
+      LaunchTemplateName: !Sub '${AWS::StackName}-app-lt'
+      LaunchTemplateData:
+        ImageId: !Ref CafeAmiId
+        InstanceType: !Ref InstanceType
+        IamInstanceProfile:
+          Name: !Ref CafeInstanceProfileName
+        SecurityGroupIds:
+          - !Ref AppSecurityGroup
+        # No public IP. Instances are in private subnets.
+        TagSpecifications:
+          - ResourceType: instance
+            Tags:
+              - Key: Name
+                Value: !Sub '${AWS::StackName}-app'
+
+  ## Load Balancer
+
+  # NEW: target group for app servers. Health check uses a static file.
+  AppTargetGroup:
+    Type: AWS::ElasticLoadBalancingV2::TargetGroup
+    Properties:
+      Name: !Sub '${AWS::StackName}-tg'
+      Port: 80
+      Protocol: HTTP
+      TargetType: instance
+      VpcId:
+        Fn::ImportValue: !Sub '${NetworkStackName}-VPCID'
+      HealthCheckPath: !Ref HealthCheckPath
+      HealthCheckIntervalSeconds: 30
+      HealthCheckTimeoutSeconds: 10
+      UnhealthyThresholdCount: 3
+      HealthyThresholdCount: 2
+      Matcher:
+        HttpCode: '200'
+
+  # NEW: internet-facing load balancer across both public subnets.
+  AppLoadBalancer:
+    Type: AWS::ElasticLoadBalancingV2::LoadBalancer
+    Properties:
+      Name: !Sub '${AWS::StackName}-alb'
+      Scheme: internet-facing
+      Type: application
+      Subnets:
+        - Fn::ImportValue: !Sub '${NetworkStackName}-PublicSubnetAID'
+        - Fn::ImportValue: !Sub '${NetworkStackName}-PublicSubnetBID'
+      SecurityGroups:
+        - !Ref AlbSecurityGroup
+
+  # NEW: HTTP listener forwarding to the target group.
+  AppListener:
+    Type: AWS::ElasticLoadBalancingV2::Listener
+    Properties:
+      LoadBalancerArn: !Ref AppLoadBalancer
+      Port: 80
+      Protocol: HTTP
+      DefaultActions:
+        - Type: forward
+          TargetGroupArn: !Ref AppTargetGroup
+
+  ## Auto Scaling
+
+  # NEW: group spans both private subnets. Size comes from parameters.
+  # Health checks use the load balancer, with a 300-second grace period.
+  AppAutoScalingGroup:
+    Type: AWS::AutoScaling::AutoScalingGroup
+    Properties:
+      AutoScalingGroupName: !Sub '${AWS::StackName}-asg'
+      VPCZoneIdentifier:
+        - Fn::ImportValue: !Sub '${NetworkStackName}-PrivateSubnetAID'
+        - Fn::ImportValue: !Sub '${NetworkStackName}-PrivateSubnetBID'
+      LaunchTemplate:
+        LaunchTemplateId: !Ref AppLaunchTemplate
+        Version: !GetAtt AppLaunchTemplate.LatestVersionNumber
+      MinSize: !Ref AsgMinSize
+      DesiredCapacity: !Ref AsgDesiredCapacity
+      MaxSize: !Ref AsgMaxSize
+      TargetGroupARNs:
+        - !Ref AppTargetGroup
+      HealthCheckType: ELB
+      HealthCheckGracePeriod: 300
+      Tags:
+        - Key: Name
+          Value: !Sub '${AWS::StackName}-app'
+          PropagateAtLaunch: true
+
+  # NEW: target tracking policy. Adds servers above 50 percent average CPU
+  # and removes them when CPU stays low.
+  AppScalingPolicy:
+    Type: AWS::AutoScaling::ScalingPolicy
+    Properties:
+      AutoScalingGroupName: !Ref AppAutoScalingGroup
+      PolicyType: TargetTrackingScaling
+      TargetTrackingConfiguration:
+        PredefinedMetricSpecification:
+          PredefinedMetricType: ASGAverageCPUUtilization
+        TargetValue: 50
+
+######################
+# Outputs section
+######################
+
+Outputs:
+
+  LoadBalancerDNSName:
+    Description: Open this in the browser over HTTP, with /cafe/ on the end
+    Value: !GetAtt AppLoadBalancer.DNSName
+
+  DbEndpoint:
+    Description: >-
+      Endpoint for the /cafe/dbUrl secret. Update the secret to this value
+      before the app servers launch.
+    Value: !GetAtt DbInstance.Endpoint.Address
+
+  AutoScalingGroupName:
+    Description: Name of the app server Auto Scaling group
+    Value: !Ref AppAutoScalingGroup
+
+  TargetGroupArn:
+    Description: Target group ARN for the load balancer health checks
+    Value: !Ref AppTargetGroup
